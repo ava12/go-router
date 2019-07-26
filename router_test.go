@@ -1,10 +1,10 @@
 package router
 
 import (
-	"testing"
 	"net/http"
-	"strconv"
 	"net/url"
+	"strconv"
+	"testing"
 )
 
 
@@ -14,10 +14,12 @@ type mockHandler struct {
 }
 
 var expectedHandler *mockHandler
+var lastRequest *http.Request
 
-func (mh *mockHandler) ServeEx (c *Context) {
+func (mh *mockHandler) ServeHTTP (w http.ResponseWriter, r *http.Request) {
+	lastRequest = r
 	if expectedHandler.Id != mh.Id {
-		mh.t.Errorf("%s %s: expecting \"%s\" handler, got \"%s\"", c.Request.Method, c.Request.URL.String(), expectedHandler.Id, mh.Id)
+		mh.t.Errorf("%s %s: expecting \"%s\" handler, got \"%s\"", r.Method, r.URL.String(), expectedHandler.Id, mh.Id)
 	}
 }
 
@@ -61,23 +63,21 @@ func TestMethodRouter (t *testing.T) {
 		{http.MethodDelete, hDefault},
 	}
 
-	env := make(map[string]string)
-
 	for _, c := range cases {
 		mr.Method = c.m
 		expectedHandler = c.h
-		r.ServeEx(&Context {&mw, &mr, env})
+		r.ServeHTTP(&mw, &mr)
 	}
 
 	r.Add(http.MethodHead, hHead)
 	mr.Method = http.MethodHead
 	expectedHandler = hHead
-	r.ServeEx(&Context {&mw, &mr, env})
+	r.ServeHTTP(&mw, &mr)
 }
 
 
 func runPathSpecs (t *testing.T, cases [][]string, areValid bool) {
-	h := &mockHandler{t, ""}
+	h := &mockHandler {t, ""}
 	mustFail := !areValid
 
 	for index, paths := range cases {
@@ -211,12 +211,16 @@ func TestPathRouter (t *testing.T) {
 
 		request.URL = Url
 		expectedHandler.Id = match.Expected
-		c := &Context {&mw, &request, make(map[string]string)}
-		pr.ServeEx(c)
+		pr.ServeHTTP(&mw, &request)
 
 		if match.Params != nil && len(match.Params) > 0 {
+			ctx := lastRequest.Context()
 			for name, value := range match.Params {
-				got := c.Env[name]
+				igot := ctx.Value(name)
+				got := ""
+				if igot != nil {
+					got = igot.(string)
+				}
 				if got != value {
 					t.Errorf("%s, expected %s=%s, got %v", match.Url, name, value, got)
 				}

@@ -3,54 +3,11 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"strconv"
 )
-
-// Context содержит данные, передаваемые маршрутизатором в обработчик запроса.
-type Context struct {
-	Writer http.ResponseWriter
-	Request *http.Request
-
-	// Env содержит параметры и "хвост", захваченные при разборе пути.
-	Env map[string]string
-}
-
-// Handler - интерфейс обработчика запросов.
-type Handler interface {
-	ServeEx (*Context)
-}
-
-// HandlerFunc - адаптер для функций, реализующий интерфейс Handler
-// (аналогично net/http.HandlerFunc).
-type HandlerFunc func (*Context)
-
-func (hf HandlerFunc) ServeEx (c *Context) {
-	hf(c)
-}
-
-// HandlerAdapter() создает обертку для реализации net/http.Handler, реализующую Handler
-func HandlerAdapter (handler http.Handler) Handler {
-	return &handlerAdapter {handler}
-}
-
-
-type handlerAdapter struct {
-	handler http.Handler
-}
-
-func (ha *handlerAdapter) ServeEx (c *Context) {
-	ha.handler.ServeHTTP(c.Writer, c.Request)
-}
-
-// HttpHandler() создает обертку для реализации Handler, реализующую net/http.Handler
-func HttpHandler (h Handler) http.Handler {
-	return http.HandlerFunc(func (rw http.ResponseWriter, r *http.Request) {
-		h.ServeEx(&Context {rw, r, make(map[string]string)})
-	})
-}
-
 
 // RouteSpecError - тип ошибки для некорректно заданного маршрута.
 type RouteSpecError struct {m string}
@@ -71,13 +28,13 @@ type MethodRouter struct {
 	handlers []*methodHandler
 
 	// defaultHandler - обработчик по умолчанию (не nil!).
-	defaultHandler Handler
+	defaultHandler http.Handler
 }
 
 // methodHandler - структура, хранящая обработчик для определенного HTTP-метода.
 type methodHandler struct {
 	// handler содержит обработчик для требуемого метода.
-	handler Handler
+	handler http.Handler
 
 	// method содержит имя HTTP-метода.
 	method string
@@ -85,9 +42,9 @@ type methodHandler struct {
 
 // NewMethodRouter() создает маршрутизатор по HTTP-методу.
 // Если defaultHandler не задан, то используется обертка для net/http.NotFoundHandler().
-func NewMethodRouter (defaultHandler Handler) *MethodRouter {
+func NewMethodRouter (defaultHandler http.Handler) *MethodRouter {
 	if defaultHandler == nil {
-		defaultHandler = HandlerAdapter(http.NotFoundHandler())
+		defaultHandler = http.NotFoundHandler()
 	}
 	return &MethodRouter {handlers: make([]*methodHandler, 0, 2), defaultHandler: defaultHandler}
 }
@@ -105,7 +62,7 @@ func (mr *MethodRouter) find (method string) *methodHandler {
 
 // Add() добавляет обработчик для указанного метода.
 // Возвращает ошибку, если обработчик уже задан.
-func (mr *MethodRouter) Add (method string, handler Handler) error {
+func (mr *MethodRouter) Add (method string, handler http.Handler) error {
 	mh := mr.find(method)
 	if mh != nil {
 		return &RouteSpecError {"handler already set"}
@@ -116,20 +73,20 @@ func (mr *MethodRouter) Add (method string, handler Handler) error {
 }
 
 // AddGet() добавляет/заменяет обработчик для метода GET.
-func (mr *MethodRouter) AddGet (handler Handler) {
+func (mr *MethodRouter) AddGet (handler http.Handler) {
 	mr.Add(http.MethodGet, handler)
 }
 
 // AddPost() добавляет/заменяет обработчик для метода POST.
-func (mr *MethodRouter) AddPost (handler Handler) {
+func (mr *MethodRouter) AddPost (handler http.Handler) {
 	mr.Add(http.MethodPost, handler)
 }
 
-// ServeEx() ищет и вызывает обработчик для текущего метода (либо обработчик по умолчанию).
-func (mr *MethodRouter) ServeEx (c *Context) {
-	var handler Handler
-	mh := mr.find(c.Request.Method)
-	if mh == nil && c.Request.Method == http.MethodHead {
+// ServeHTTP() ищет и вызывает обработчик для текущего метода (либо обработчик по умолчанию).
+func (mr *MethodRouter) ServeHTTP (w http.ResponseWriter, r *http.Request) {
+	var handler http.Handler
+	mh := mr.find(r.Method)
+	if mh == nil && r.Method == http.MethodHead {
 		mh = mr.find(http.MethodGet)
 	}
 	if mh != nil {
@@ -137,7 +94,7 @@ func (mr *MethodRouter) ServeEx (c *Context) {
 	} else {
 		handler = mr.defaultHandler
 	}
-	handler.ServeEx(c)
+	handler.ServeHTTP(w, r)
 }
 
 
@@ -168,7 +125,7 @@ type pathPartNode struct {
 
 	// handler - обработчик для данного узла;
 	// nil, если узел не может быть конечной точкой в разборе пути.
-	handler Handler
+	handler http.Handler
 
 	// tailAllowed - true, если узел может быть конечной точкой разбора,
 	// и путь может содержать "хвост"; иначе false.
@@ -284,7 +241,7 @@ func (pn *pathPartNode) addParam (name string, typ int) (*pathPartNode, error) {
 
 // SetHandler() задает обработчик для данного узла.
 // Возвращает ошибку, если обработчик уже задан.
-func (pn *pathPartNode) SetHandler (handler Handler, tailAllowed bool) error {
+func (pn *pathPartNode) SetHandler (handler http.Handler, tailAllowed bool) error {
 	if pn.handler != nil {
 		return &RouteSpecError {"handler already set"}
 	}
@@ -341,7 +298,7 @@ loop:
 // конечной точкой разбора и либо URL-путь разобран полностью (hasTail = false),
 // либо узел допускает наличие "хвоста".
 // Возвращает nil в противном случае.
-func (pn *pathPartNode) GetHandler (hasTail bool) Handler {
+func (pn *pathPartNode) GetHandler (hasTail bool) http.Handler {
 	if hasTail && !pn.tailAllowed {
 		return nil
 
@@ -416,9 +373,9 @@ PathRouter маршрутизирует запросы по URL-пути.
  - #имя - положительный целочисленный параметр;
  - * - необязательный "хвост" пути (может быть только последним элементом).
 
-Все параметры, захваченные при разборе пути, заносятся в карту Env
-передаваемого обработчику контекста, под соответствующими именами.
-Если имеется неразобранный "хвост" пути, то он записывается в Env["*"].
+Все параметры, захваченные при разборе пути, добавляются в контекст
+HTTP-запроса, под соответствующими именами.
+Если имеется неразобранный "хвост" пути, то он записывается в параметр "*".
 
 Маршрутизатор, разумеется, пытается использовать самый длинный путь разбора
 (длина "хвоста" не учитывается).
@@ -442,7 +399,7 @@ URL "/user/1" будет распознан как первый путь, "/user
 */
 type PathRouter struct {
 	// defaultHandler - обработчик по умолчанию (не nil!).
-	defaultHandler Handler
+	defaultHandler http.Handler
 
 	// pathTree - дерево заданных путей, изначально nil.
 	// Корень соответствует корневому URL-пути ("/").
@@ -451,15 +408,16 @@ type PathRouter struct {
 
 // NewPathRouter() создает маршрутизатор по URL-пути.
 // Если defaultHandler не задан, то используется обертка для net/http.NotFoundHandler().
-func NewPathRouter (defaultHandler Handler) *PathRouter {
+func NewPathRouter (defaultHandler http.Handler) *PathRouter {
 	if defaultHandler == nil {
-		defaultHandler = HandlerAdapter(http.NotFoundHandler())
+		defaultHandler = http.NotFoundHandler()
 	}
 	return &PathRouter {defaultHandler, &pathPartNode {}}
 }
+
 // Add() добавляет обработчик для указанного пути.
 // Возвращает ошибку, если путь задан некорректно либо обработчик для пути уже задан.
-func (pr *PathRouter) Add (pathString string, handler Handler) error {
+func (pr *PathRouter) Add (pathString string, handler http.Handler) error {
 	var (e error; tailAllowed bool)
 
 	pathString = strings.Trim(pathString, "/")
@@ -488,18 +446,22 @@ func (pr *PathRouter) Add (pathString string, handler Handler) error {
 	return node.SetHandler(handler, tailAllowed)
 }
 
-// ServeEx() ищет и вызывает обработчик для текущего пути (либо обработчик по умолчанию).
-func (pr *PathRouter) ServeEx (c *Context) {
+type paramEntry struct {
+	name, value string
+}
+
+// ServeHTTP() ищет и вызывает обработчик для текущего пути (либо обработчик по умолчанию).
+func (pr *PathRouter) ServeHTTP (w http.ResponseWriter, r *http.Request) {
 	if pr.pathTree == nil {
-		pr.defaultHandler.ServeEx(c)
+		pr.defaultHandler.ServeHTTP(w, r)
 		return
 	}
 
-	path := strings.Split(strings.Trim(c.Request.URL.Path, "/"), "/")
+	path := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if path[0] == "" {
 		path = []string {}
 	}
-	params := [][2]string {}
+	params := []paramEntry {}
 	lastPartIndex := len(path) - 1
 
 	matchedHandler := pr.defaultHandler
@@ -520,7 +482,7 @@ func (pr *PathRouter) ServeEx (c *Context) {
 		}
 
 		if paramName != "" {
-			params = append(params, [2]string {paramName, part})
+			params = append(params, paramEntry {paramName, part})
 		}
 
 		node = nextNode
@@ -534,16 +496,20 @@ func (pr *PathRouter) ServeEx (c *Context) {
 		matchedParamCnt = len(params)
 	}
 
-
+	ctx := r.Context()
 	if matchedParamCnt > 0 {
 		for _, entry := range params[:matchedParamCnt] {
-			c.Env[entry[0]] = entry[1]
+			ctx = context.WithValue(ctx, entry.name, entry.value)
 		}
 	}
 
 	if matchedPos < lastPartIndex {
-		c.Env["*"] = strings.Join(path[matchedPos + 1:], "/")
+		ctx = context.WithValue(ctx, "*", strings.Join(path[matchedPos + 1:], "/"))
 	}
 
-	matchedHandler.ServeEx(c)
+	if matchedParamCnt > 0 || matchedPos < lastPartIndex {
+		r = r.WithContext(ctx)
+	}
+
+	matchedHandler.ServeHTTP(w, r)
 }
